@@ -1,5 +1,8 @@
+import concurrent.futures
 import logging
+import multiprocessing
 import os
+import threading
 
 from virt_backup.backups import DomBackup, build_dom_complete_backup_from_def
 from virt_backup.domains import search_domains_regex
@@ -152,6 +155,31 @@ class BackupGroup():
         for backup in self.backups:
             for attr, val in self.default_bak_param.items():
                 setattr(backup, attr, val)
+
+    def start_multithread(self, nb_threads=None):
+        nb_threads = nb_threads or multiprocessing.cpu_count()
+        notify_event = threading.Event()
+        domain_locks = set()
+        pending_backups = self.backups.copy()
+
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            while pending_backups:
+                locked_backups = []
+                for backup in pending_backups:
+                    if backup.dom in domain_locks:
+                        locked_backups.append(backup)
+                        continue
+
+                    self._ensure_backup_is_set_in_domain_dir(backup)
+                    future = executor.submit(backup.start)
+                    future.add_done_callback(lambda: notify_event.set)
+
+                if locked_backups:
+                    notify_event.wait()
+                    notify_event.clear()
+                    pending_backups = locked_backups
+
+            concurrent.futures.wait(executor)
 
     def start(self):
         """
