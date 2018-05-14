@@ -1,3 +1,4 @@
+from collections import defaultdict
 import concurrent.futures
 import logging
 import multiprocessing
@@ -157,29 +158,42 @@ class BackupGroup():
                 setattr(backup, attr, val)
 
     def start_multithread(self, nb_threads=None):
+        finished_dom_queue = []
+
+        def _exec_backup(backup):
+            try:
+                self._ensure_backup_is_set_in_domain_dir(backup)
+                backup.start()
+            finally:
+                finished_dom_queue.append(backup.dom)
+
         nb_threads = nb_threads or multiprocessing.cpu_count()
         notify_event = threading.Event()
-        domain_locks = set()
-        pending_backups = self.backups.copy()
 
+        backups_by_domain = defaultdict(list)
+        for b in self.backups:
+            backups_by_domain[b.dom].append(b)
+
+        futures = []
         with concurrent.futures.ProcessPoolExecutor() as executor:
-            while pending_backups:
-                locked_backups = []
-                for backup in pending_backups:
-                    if backup.dom in domain_locks:
-                        locked_backups.append(backup)
-                        continue
+            for backups_for_domain in backups_by_domain:
+                backup = backups_for_domain.pop()
+                if not backups_for_domain:
+                    backups_by_domain.pop(backup.dom)
+                future = executor.submit(_exec_backup, backup)
+                futures.append(future)
+                future.add_done_callback(lambda: notify_event.set)
 
-                    self._ensure_backup_is_set_in_domain_dir(backup)
-                    future = executor.submit(backup.start)
+            while len(futures) < len(self.backups):
+                notify_event.wait()
+                dom = finished_dom_queue.pop()
+                if backups_by_domain[dom]:
+                    backup = backups_by_domain[dom].pop()
+                    future = executor.submit(_exec_backup, backup)
+                    futures.append(future)
                     future.add_done_callback(lambda: notify_event.set)
 
-                if locked_backups:
-                    notify_event.wait()
-                    notify_event.clear()
-                    pending_backups = locked_backups
-
-            concurrent.futures.wait(executor)
+        return concurrent.futures.wait(future)
 
     def start(self):
         """
