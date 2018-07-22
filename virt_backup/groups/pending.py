@@ -3,7 +3,6 @@ import concurrent.futures
 import logging
 import multiprocessing
 import os
-import threading
 
 from virt_backup.backups import DomBackup, build_dom_complete_backup_from_def
 from virt_backup.domains import search_domains_regex
@@ -157,51 +156,60 @@ class BackupGroup():
             for attr, val in self.default_bak_param.items():
                 setattr(backup, attr, val)
 
-    def start_multithread(self, nb_threads=None):
-        finished_dom_queue = []
-
-        def _exec_backup(backup):
-            try:
-                self._ensure_backup_is_set_in_domain_dir(backup)
-                backup.start()
-            finally:
-                finished_dom_queue.append(backup.dom)
-
-        nb_threads = nb_threads or multiprocessing.cpu_count()
-        notify_event = threading.Event()
-
-        backups_by_domain = defaultdict(list)
-        for b in self.backups:
-            backups_by_domain[b.dom].append(b)
-
-        futures = []
-        with concurrent.futures.ProcessPoolExecutor() as executor:
-            for backups_for_domain in backups_by_domain:
-                backup = backups_for_domain.pop()
-                if not backups_for_domain:
-                    backups_by_domain.pop(backup.dom)
-                future = executor.submit(_exec_backup, backup)
-                futures.append(future)
-                future.add_done_callback(lambda: notify_event.set)
-
-            while len(futures) < len(self.backups):
-                notify_event.wait()
-                dom = finished_dom_queue.pop()
-                if backups_by_domain[dom]:
-                    backup = backups_by_domain[dom].pop()
-                    future = executor.submit(_exec_backup, backup)
-                    futures.append(future)
-                    future.add_done_callback(lambda: notify_event.set)
-
-        return concurrent.futures.wait(future)
-
     def start(self):
         """
         Start to backup all DomBackup objects attached
         """
         for b in self.backups:
-            self._ensure_backup_is_set_in_domain_dir(b)
-            b.start()
+            self._start_backup(b)
+
+    def start_multithread(self, nb_threads=None):
+        nb_threads = nb_threads or multiprocessing.cpu_count()
+
+        backups_by_domain = self._group_backups_by_domain()
+
+        completed_doms = []
+        futures = []
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            for backups_for_domain in backups_by_domain.values():
+                backup = backups_for_domain.pop()
+                futures.append(self._submit_backup_future(
+                    executor, backup, completed_doms
+                ))
+
+            while len(futures) < len(self.backups):
+                next(concurrent.futures.as_completed(futures))
+                dom = completed_doms.pop()
+                if backups_by_domain.get(dom):
+                    backup = backups_by_domain[dom].pop()
+                    futures.append(self._submit_backup_future(
+                        executor, backup, completed_doms
+                    ))
+
+            return concurrent.futures.wait(futures)
+
+    def _group_backups_by_domain(self):
+        backups_by_domain = defaultdict(list)
+        for b in self.backups:
+            backups_by_domain[b.dom].append(b)
+
+        return backups_by_domain
+
+    def _submit_backup_future(self, executor, backup, completed_doms: list):
+        """
+        :param completed_doms: list where a completed backup will append its
+            domain.
+        """
+        future = executor.submit(self._start_backup, backup)
+        future.add_done_callback(
+            lambda: completed_doms.append(backup.dom)
+        )
+
+        return future
+
+    def _start_backup(self, backup):
+        self._ensure_backup_is_set_in_domain_dir(backup)
+        backup.start()
 
     def _ensure_backup_is_set_in_domain_dir(self, dombackup):
         """
